@@ -1,26 +1,60 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 
+using PaymentGateway.Api.Enums;
+using PaymentGateway.Api.Models;
+using PaymentGateway.Api.Models.Requests;
 using PaymentGateway.Api.Models.Responses;
+using PaymentGateway.Api.Observability;
 using PaymentGateway.Api.Services;
 
 namespace PaymentGateway.Api.Controllers;
 
 [Route("api/[controller]")]
 [ApiController]
-public class PaymentsController : Controller
-{
-    private readonly PaymentsRepository _paymentsRepository;
+[TypeFilter(typeof(PaymentsControllerExceptionFilter))]
 
-    public PaymentsController(PaymentsRepository paymentsRepository)
+public class PaymentsController(
+    PaymentsRepository paymentsRepository,
+    IAcquiringBankClient acquiringBankClient,
+    TimeProvider timeProvider)
+    : ControllerBase
+{
+    [HttpPost]
+    public async Task<ActionResult<PaymentResponse>> CreatePaymentAsync(
+        [FromBody] CreatePaymentRequest request,
+        CancellationToken cancellationToken)
     {
-        _paymentsRepository = paymentsRepository;
+        request.RecordTracing(); // this can become a generic middleware as a cross-cutting concern
+
+        if (PaymentValidator.Validate(request, timeProvider.GetUtcNow().DateTime) is { } errors)
+        {
+            return BadRequest(errors.ToProblemDetails());
+        }
+
+        var bankAuthResult = await acquiringBankClient.AuthorizeAsync(request.ToBankPaymentRequest(), cancellationToken);
+        var bankAccountAuth = bankAuthResult is null
+            ? new BankAuthorization(PaymentStatus.Declined)
+            : new BankAuthorization(PaymentStatus.Authorized, bankAuthResult);
+
+        var payment = request.ToPaymentModel(bankAccountAuth);
+        paymentsRepository.Add(payment);
+
+        payment.RecordTracing();
+        payment.RecordMetrics();
+
+        var response = payment.ToResponse();
+        return CreatedAtRoute(nameof(GetPayment), new { id = response.Id }, response);
     }
 
-    [HttpGet("{id:guid}")]
-    public async Task<ActionResult<PostPaymentResponse?>> GetPaymentAsync(Guid id)
+    [HttpGet("{id:guid}", Name = nameof(GetPayment))]
+    public ActionResult<PaymentResponse?> GetPayment(Guid id)
     {
-        var payment = _paymentsRepository.Get(id);
+        var payment = paymentsRepository.Get(id);
 
-        return new OkObjectResult(payment);
+        return payment?.ToResponse() switch
+        {
+            { } response => Ok(response),
+            _ => Problem(statusCode: StatusCodes.Status404NotFound, title: "Payment not found.")
+        };
     }
 }
